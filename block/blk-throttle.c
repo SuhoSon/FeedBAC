@@ -11,6 +11,7 @@
 #include <linux/bio.h>
 #include <linux/blktrace_api.h>
 #include <linux/blk-cgroup.h>
+#include <../drivers/lightnvm/pblk.h> // TODO: 리팩토링이 반드시 필요한 부분
 #include "blk.h"
 
 /* Max dispatch from a group in 1 round */
@@ -1142,10 +1143,21 @@ static void inline tg_reflect_pblk(struct bio *bio) {
 	 * When the user max value becomes 0, user IO is not processed.
 	 */
 	struct blkcg *blkcg = bio->bi_blkg->blkcg;
+#if 0
 	int gc_active = blkcg->gc_active;
 
 	if (gc_active)
 		trace_printk("may be... GC start");
+#else
+	struct pblk *pblk = (struct pblk *)blkcg->private;
+	uint64_t user_wa, gc_wa;
+
+	user_wa = atomic64_read(&pblk->user_wa);
+	gc_wa = atomic64_read(&pblk->gc_wa);
+
+	trace_printk("[%s(%s):%d] %llu %llu\n",
+			__FILE__, __func__, __LINE__, user_wa, gc_wa);
+#endif
 }
 
 static bool tg_with_in_credit_limit(struct bio *bio, struct throtl_grp *tg) {
@@ -1159,10 +1171,9 @@ static bool tg_with_in_credit_limit(struct bio *bio, struct throtl_grp *tg) {
 	bool rw = bio_data_dir(bio), passed = false;
 	
 	/* pd_offline을 하게 되면 해당 정보는 초기화 됨. */
-	/*
 	if (bio->bi_blkg->blkcg->passed)
 		tg_reflect_pblk(bio);
-	*/
+
 	if (!crs->throttle && time_before(jiffies, td->slice)) {
 		if (credit + crs->credit[RESD] - crs->credit[USED] >= CPB) {
 			crs->credit[USED] += CPB;
