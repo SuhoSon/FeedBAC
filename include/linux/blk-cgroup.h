@@ -61,6 +61,7 @@ struct blkcg {
 #endif
 	unsigned int weight;
 	int gc_active;
+	void *private;
 	bool passed;
 };
 

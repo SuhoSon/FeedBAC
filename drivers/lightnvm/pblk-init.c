@@ -85,6 +85,14 @@ static blk_qc_t pblk_make_rq(struct request_queue *q, struct bio *bio)
 		blkcg->gc_active = pblk_free_line_check(pblk);
 	}
 	*/
+
+	if (blkcg->weight) {
+		if (!blkcg->passed) {
+			blkcg->passed = true;
+		}
+		blkcg->private = (void *)pblk;
+	}
+
 	/* Read requests must be <= 256kb due to NVMe's 64 bit completion bitmap
 	 * constraint. Writes can be of arbitrary size.
 	 */
