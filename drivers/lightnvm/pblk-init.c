@@ -48,21 +48,6 @@ static struct pblk_global_caches pblk_caches = {
 
 struct bio_set pblk_bio_set;
 
-/*
-static bool pblk_free_line_check(struct pblk *pblk) {
-	struct pblk_rl *rl = &pblk->rl;
-	struct pblk_line *line = pblk->lines;
-	int werr_gc_needed = atomic_read(&rl->werr_lines);
-	int free_blocks = atomic_read(&rl->free_blocks);
-	int blk_in_lines = atomic_read(&line->blk_in_line);
-	int cur_free_blocks = free_blocks - blk_in_lines;
-
-	if (cur_free_blocks >= rl->high && (!werr_gc_needed))
-		return false;
-	
-	return true;
-}
-*/
 static blk_qc_t pblk_make_rq(struct request_queue *q, struct bio *bio)
 {
 	struct pblk *pblk = q->queuedata;
@@ -75,23 +60,10 @@ static blk_qc_t pblk_make_rq(struct request_queue *q, struct bio *bio)
 			return BLK_QC_T_NONE;
 		}
 	}
-	/* Weight가 설정되어 있을 경우, pblk의 값들을 cgroup에 넘겨줌 
-	 * nr_free_lines는 0보다 작아질 수 있으므로 flag로 구분함 
-	 */
-	/*
-	if (blkcg->weight) {
-		if (!blkcg->passed)
-			blkcg->passed = true;
-		blkcg->gc_active = pblk_free_line_check(pblk);
-	}
-	*/
 
-	if (blkcg->weight) {
-		if (!blkcg->passed) {
-			blkcg->passed = true;
-		}
+	if (blkcg->weight) 
 		blkcg->private = (void *)pblk;
-	}
+	
 
 	/* Read requests must be <= 256kb due to NVMe's 64 bit completion bitmap
 	 * constraint. Writes can be of arbitrary size.

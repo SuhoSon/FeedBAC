@@ -1824,6 +1824,9 @@ again:
 	}
 
 	blk_throtl_bio_endio(bio);
+    /* check latency for calculate read/write factor */
+    throtl_bio_lat_check(bio);
+
 	/* release cgroup info */
 	bio_uninit(bio);
 	if (bio->bi_end_io)

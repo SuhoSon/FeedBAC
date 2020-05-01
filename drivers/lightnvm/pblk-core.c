@@ -113,7 +113,7 @@ static void __pblk_end_io_erase(struct pblk *pblk, struct nvm_rq *rqd)
 static void pblk_end_io_erase(struct nvm_rq *rqd)
 {
 	struct pblk *pblk = rqd->private;
-
+    
 	__pblk_end_io_erase(pblk, rqd);
 	mempool_free(rqd, &pblk->e_rq_pool);
 }

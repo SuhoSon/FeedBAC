@@ -60,9 +60,7 @@ struct blkcg {
 	refcount_t			cgwb_refcnt;
 #endif
 	unsigned int weight;
-	int gc_active;
 	void *private;
-	bool passed;
 };
 
 /*

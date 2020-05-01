@@ -36,6 +36,7 @@ static int throtl_quantum = 32;
 #define INIT_CREDIT 15000
 #define CRD_UPDATE_TIME (HZ / 2)
 #define CRD_DIST_TIME (HZ / 10)
+#define MORE_CRD_RST_TIME (HZ / 50)
 /*
  * For HD, very small latency comes from sequential IO. Such IO is helpless to
  * help determine if its IO is impacted by others, hence we ignore the IO
@@ -110,6 +111,11 @@ enum {
 };
 
 enum {
+    R,
+    W,
+};
+
+enum {
 	ACT,
 	SUM,
 };
@@ -141,7 +147,6 @@ struct cpm_data {
 struct credit_state {
 	unsigned int credit[3];
 	bool throttle;
-	unsigned int cpm;
 	u64 time_elapsed;
 	u64 last_dist_time;
 	unsigned long dist_time;
@@ -280,7 +285,12 @@ struct throtl_data
 	/* Add members for credit distribution */
 	bool more_crd;
 	unsigned int max_weight_credit;
+    unsigned int bio_cnt[2];
+    unsigned long lat[2];
 	struct throtl_grp *tg[2];
+	unsigned long last_idle_time;
+	uint64_t user_wa;
+	uint64_t gc_wa;
 };
 
 static void throtl_pending_timer_fn(struct timer_list *t);
@@ -1049,12 +1059,11 @@ static bool tg_with_in_iops_limit(struct throtl_grp *tg, struct bio *bio,
 	return false;
 }
 
-static void throtl_predict_crd(struct throtl_grp *tg)
+static inline void throtl_predict_crd(struct throtl_grp *tg)
 {
 	struct throtl_data *td = tg->td;
     struct cpm_data *cpmd = &tg->crd->cpmd;
 	struct credit_state *crs = &tg->crd->crs;
-
     int a = 0, b = 0, s[2], alpha;
     int diff, error;
 
@@ -1062,11 +1071,14 @@ static void throtl_predict_crd(struct throtl_grp *tg)
         cpmd->cpm[SUM] += cpmd->cpm[ACT];
         cpmd->cpm[ACT] = 0;
     }
+    
+    /* reset track latency */
+    if (tg == td->tg[MAX]) {
+        td->bio_cnt[R] = td->bio_cnt[W] = 0;
+        td->lat[R] = td->lat[W] = 0;
+    }
 
     if (time_after(jiffies, cpmd->upd_time)) {
-
-		trace_printk("%u %u\n", tg->weight, cpmd->track[CNT]);
-
         if (!cpmd->s[0] || !cpmd->s[1]) {
             cpmd->s[0] = cpmd->cpm[SUM];
             cpmd->s[1] = cpmd->cpm[SUM];
@@ -1107,7 +1119,7 @@ static void throtl_predict_crd(struct throtl_grp *tg)
     }
 }
 
-static inline bool throtl_dist_crd(struct throtl_grp *tg) {
+static inline void throtl_dist_crd(struct throtl_grp *tg) {
 	struct throtl_data *td = tg->td;
 	struct credit_state *crs = &tg->crd->crs;
 	struct cpm_data *cpmd = &tg->crd->cpmd;
@@ -1131,9 +1143,8 @@ static inline bool throtl_dist_crd(struct throtl_grp *tg) {
 			crs->credit[RESD] = 0;
 	
 		cpmd->track[CRD] += crs->credit[USED];
-		cpmd->track[CNT]++;
 	
-		if (cpmd->cpm[ACT])
+		if (cpmd->cpm[ACT]) 
 			throtl_predict_crd(tg);
 	}
 
@@ -1141,13 +1152,12 @@ dist:
 	crs->throttle = false;
 	crs->credit[CUR] = td->max_weight_credit / w_ratio;
 	crs->credit[USED] =	crs->time_elapsed = 0;
+	cpmd->track[CNT]++;
 	crs->dist_time = jiffies + CRD_DIST_TIME;
 	crs->last_dist_time = ktime_get_ns();
-
-	return true;
 }
 
-static inline void throtl_state_check(struct throtl_data *td)
+static void throtl_state_check(struct throtl_data *td)
 {
     struct cgroup_subsys_state *pos_css;
     struct blkcg_gq *blkg;
@@ -1159,26 +1169,26 @@ static inline void throtl_state_check(struct throtl_data *td)
 
 		if (!crd->weight)
 			continue;
-		tg_idle++;
+		tg_active++;
 		if (time_after(jiffies, crd->crs.dist_time))
 			continue;
 		if (!crd->crs.credit[USED])
 			continue;
 		if (!crd->crs.throttle)
 			continue;
-
-		tg_active++;
+		tg_idle++;
     }
     rcu_read_unlock();
-
+	
 	if ((tg_active && tg_idle) && tg_active == tg_idle)
-		td->more_crd = true;
-	else
+		td->more_crd = true;	
+	 else
 		td->more_crd = false;
 }
 
 static inline void tg_elapsed_time_check(struct throtl_grp *tg) {
 	struct credit_state *crs = &tg->crd->crs;
+	struct cpm_data *cpmd = &tg->crd->cpmd;
 	u64 time_elapsed = 0;
 	unsigned int cpm = 0;
 
@@ -1190,55 +1200,63 @@ static inline void tg_elapsed_time_check(struct throtl_grp *tg) {
 	if (time_elapsed > 0 && cpm > 0)
 		do_div(cpm, time_elapsed);
 
-	crs->cpm = cpm;
+	cpmd->cpm[ACT] = cpm;
 	crs->throttle = true;
-
+	
 	throtl_state_check(tg->td);
 }	
 
-static void inline tg_reflect_pblk(struct bio *bio) {
-	/*
-	 * blkcg can be accessed through bio.
-	 * Therefore, if pblk is mapped to blkcg, 
-	 * pblk can be used in the this layer.
-	 * Mapping pblk to bio is done in pblk_make_rq()
-	 * This because, pblk_make_rq() is called 
-	 * before entering the block layer.
-	 * (blkcg is initialized when td_pd_offline() is called.)
-	 *
-	 * When the user max value becomes 0, user IO is not processed.
-	 */
-	struct blkcg *blkcg = bio->bi_blkg->blkcg;
-#if 0
-	int gc_active = blkcg->gc_active;
+static bool inline tg_io_stop(struct bio *bio) {
+    struct pblk *pblk = (struct pblk *)bio->bi_blkg->blkcg->private;
+    struct pblk_rl *rl = &pblk->rl;
+    /* When the rb_user_max becomes 0, user IO is not processed. */
+    return !rl->rb_user_max;
+}
 
-	if (gc_active)
-		trace_printk("may be... GC start");
-#else
-	struct pblk *pblk = (struct pblk *)blkcg->private;
-	uint64_t user_wa, gc_wa;
-
-	user_wa = atomic64_read(&pblk->user_wa);
-	gc_wa = atomic64_read(&pblk->gc_wa);
-
-	trace_printk("[%s(%s):%d] %llu %llu\n",
-			__FILE__, __func__, __LINE__, user_wa, gc_wa);
-#endif
+static bool inline tg_reflect_pblk(struct bio *bio) {
+    /*
+    * blkcg can be accessed through bio.
+    * Therefore, if pblk is mapped to blkcg, 
+    * pblk can be used in the this layer.
+    * Mapping pblk to bio is done in pblk_make_rq()
+    * This because, pblk_make_rq() is called 
+    * before entering the block layer.
+    * (blkcg is initialized when throtl_pd_offline() is called.)
+    */
+    struct pblk *pblk = (struct pblk *)bio->bi_blkg->blkcg->private;
+    struct pblk_rl *rl = &pblk->rl;
+    unsigned int nr_blocks_need = rl->high;
+    unsigned int nr_blocks_free = atomic_read(&rl->free_blocks);
+    unsigned int werr_lines = atomic_read(&rl->werr_lines);
+    unsigned int gc_q_depth = atomic_read(&pblk->gc.read_inflight_gc);
+    
+    return ((werr_lines > 0) || 
+            ((pblk->gc.gc_active) && (nr_blocks_need > nr_blocks_free)))
+            && gc_q_depth <= 4;
 }
 
 static bool tg_with_in_credit_limit(struct bio *bio, struct throtl_grp *tg) {
-	struct throtl_data *td = tg->td;
-	struct credit_state *crs = &tg->crd->crs;
-	unsigned int bio_size = throtl_bio_data_size(bio);
-	unsigned int CPB = bio_size / 512;
-	bool rw = bio_data_dir(bio), time_out = false;
-
+    struct throtl_data *td = tg->td;
+    struct credit_state *crs = &tg->crd->crs;
+    struct blkcg * blkcg = bio->bi_blkg->blkcg;
+    unsigned int bio_size = throtl_bio_data_size(bio);
+    unsigned int CPB = bio_size / 512;
+    bool rw = bio_data_dir(bio), time_out = false;
+    bool gc_run, user_io_stop;
+	
 again:
-	/* pd_offline을 하게 되면 해당 정보는 초기화 됨. */
-	/*
-	if (bio->bi_blkg->blkcg->passed)
-		tg_reflect_pblk(bio);
-	*/
+	if (blkcg->private && rw) {
+        gc_run = tg_reflect_pblk(bio);
+        user_io_stop = tg_io_stop(bio);
+#if 1
+        if (gc_run)
+            CPB *= 2;
+#else
+        if (user_io_stop)
+            return false;
+#endif
+	}
+
 	if (time_before(jiffies, crs->dist_time)) {
 		if (crs->credit[CUR] + crs->credit[RESD] - crs->credit[USED] >= CPB) {
 			crs->credit[USED] += CPB;
@@ -1248,7 +1266,7 @@ again:
 	} else
 		time_out = true;
 
-	if (td->more_crd || time_out) {
+	if ((td->more_crd)|| time_out) {
 		throtl_dist_crd(tg);
 		goto again;
 	}
@@ -2518,10 +2536,10 @@ bool blk_throtl_bio(struct request_queue *q, struct blkcg_gq *blkg,
 
 	WARN_ON_ONCE(!rcu_read_lock_held());
 	/* see throtl_charge_bio() */
-        if (bio_flagged(bio, BIO_THROTTLED ||
-                (!tg->has_rules[rw] && !tg->weight)))
-                goto out;
-
+    if ((bio_flagged(bio, BIO_THROTTLED) 
+    || (!tg->has_rules[rw])) && !tg->weight)
+    goto out;
+    
 	spin_lock_irq(&q->queue_lock);
 
 	throtl_update_latency_buckets(td);
@@ -2672,6 +2690,7 @@ void blk_throtl_bio_endio(struct bio *bio)
 
 	start_time = bio_issue_time(&bio->bi_issue) >> 10;
 	finish_time = __bio_issue_time(finish_time_ns) >> 10;
+
 	if (!start_time || finish_time <= start_time)
 		return;
 
@@ -2703,6 +2722,32 @@ void blk_throtl_bio_endio(struct bio *bio)
 		tg->bio_cnt /= 2;
 		tg->bad_bio_cnt /= 2;
 	}
+}
+#else
+void throtl_bio_lat_check(struct bio *bio)
+{
+    struct blkcg_gq *blkg= bio->bi_blkg;
+    struct throtl_data *td;
+    u64 finish_time_ns;
+    unsigned long finish_time, start_time, lat;
+    int rw = bio_data_dir(bio);
+
+    if (!blkg || !blkg->blkcg->weight)
+       return;
+
+    td = blkg_to_tg(blkg)->td;
+	
+    finish_time_ns = ktime_get_ns();
+    start_time = bio_issue_time(&bio->bi_issue) >> 10;
+    finish_time = __bio_issue_time(finish_time_ns) >> 10;
+
+    if (!start_time || finish_time <= start_time)
+        return;
+
+    lat = finish_time - start_time;
+
+    td->lat[rw] += lat;
+    td->bio_cnt[rw]++;
 }
 #endif
 
