@@ -321,7 +321,7 @@ extern ssize_t blk_throtl_sample_time_store(struct request_queue *q,
 extern void blk_throtl_bio_endio(struct bio *bio);
 extern void blk_throtl_stat_add(struct request *rq, u64 time);
 #else
-extern void throtl_bio_lat_check(struct bio *bio);
+extern void throtl_bio_crd_check(struct bio *bio);
 static inline void blk_throtl_bio_endio(struct bio *bio) { }
 static inline void blk_throtl_stat_add(struct request *rq, u64 time) { }
 #endif

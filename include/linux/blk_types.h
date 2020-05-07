@@ -110,7 +110,8 @@ static inline bool blk_path_error(blk_status_t error)
 #define BIO_ISSUE_THROTL_SKIP_LATENCY (1ULL << 63)
 
 struct bio_issue {
-	u64 value;
+    u64 value;
+    unsigned int CPB[2];
 };
 
 static inline u64 __bio_issue_time(u64 time)
